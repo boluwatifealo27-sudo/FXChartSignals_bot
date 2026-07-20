@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+subscribers.json
+last_signals.json
+charts/
+venv/
+.DS_Store
