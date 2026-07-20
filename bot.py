@@ -5,15 +5,16 @@ Fetches forex price data (Yahoo Finance), calculates RSI + EMA50,
 checks for BUY/SELL signals, draws a candlestick chart with markers,
 and sends the chart + signal info to subscribed Telegram users.
 
-Built to run on Railway (or any host) via GitHub deployment.
+Two ways signals reach users:
+1. AUTOMATIC — background scan every CHECK_INTERVAL_SECONDS, sends
+   only when a fresh EMA crossover happens (sent to all subscribers)
+2. ON-DEMAND — any user (subscribed or not) can send /signal, pick
+   a pair from buttons, and instantly get a chart with the CURRENT
+   market state (BUY / SELL / NEUTRAL), even without a crossover
 
 Indicators used:
 - EMA50 (trend direction)
 - RSI 14 (momentum / overbought-oversold filter)
-
-Signal logic:
-- BUY  -> price crosses ABOVE EMA50 AND RSI < 70
-- SELL -> price crosses BELOW EMA50 AND RSI > 30
 
 DISCLAIMER: This is a technical-indicator based tool for educational/
 informational purposes only. It is NOT financial advice, and no
@@ -30,8 +31,13 @@ import mplfinance as mpf
 import pandas as pd
 import pandas_ta as ta
 import yfinance as yf
-from telegram import Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
 
 # ----------------------------------------------------------------------
 # CONFIG
@@ -49,9 +55,6 @@ TIMEFRAME = os.environ.get("TIMEFRAME", "15m")
 LOOKBACK_PERIOD = os.environ.get("LOOKBACK_PERIOD", "5d")
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "900"))
 
-# Railway's filesystem is ephemeral on redeploy, but persists between
-# requests during a running deployment. For real persistence across
-# redeploys, mount a Railway Volume at /data (see README).
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else ".")
 SUBSCRIBERS_FILE = os.path.join(DATA_DIR, "subscribers.json")
 LAST_SIGNAL_FILE = os.path.join(DATA_DIR, "last_signals.json")
@@ -66,7 +69,7 @@ logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------
-# STORAGE HELPERS (simple JSON files instead of a database)
+# STORAGE HELPERS
 # ----------------------------------------------------------------------
 def load_json(path, default):
     if os.path.exists(path):
@@ -129,7 +132,8 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def check_signal(df: pd.DataFrame):
+def check_crossover_signal(df: pd.DataFrame):
+    """Used by the AUTOMATIC scanner — only fires on a fresh crossover."""
     if len(df) < 55:
         return None, None, None, None
 
@@ -146,16 +150,40 @@ def check_signal(df: pd.DataFrame):
     atr = float((df["High"] - df["Low"]).rolling(14).mean().iloc[-1])
 
     if crossed_up and last["RSI"] < 70:
-        sl = entry - 1.5 * atr
-        tp = entry + 2 * atr
-        return "BUY", entry, sl, tp
+        return "BUY", entry, entry - 1.5 * atr, entry + 2 * atr
 
     if crossed_down and last["RSI"] > 30:
-        sl = entry + 1.5 * atr
-        tp = entry - 2 * atr
-        return "SELL", entry, sl, tp
+        return "SELL", entry, entry + 1.5 * atr, entry - 2 * atr
 
     return None, None, None, None
+
+
+def get_current_state(df: pd.DataFrame):
+    """
+    Used by the ON-DEMAND /signal command — always returns a reading,
+    even if there's no fresh crossover. Classifies the CURRENT market
+    position relative to EMA50 + RSI so users always get a chart.
+    """
+    last = df.iloc[-1]
+    entry = float(last["Close"])
+    rsi_value = float(last["RSI"])
+    ema_value = float(last["EMA50"])
+    atr = float((df["High"] - df["Low"]).rolling(14).mean().iloc[-1])
+
+    if entry > ema_value and rsi_value < 70:
+        state = "BUY"
+        sl = entry - 1.5 * atr
+        tp = entry + 2 * atr
+    elif entry < ema_value and rsi_value > 30:
+        state = "SELL"
+        sl = entry + 1.5 * atr
+        tp = entry - 2 * atr
+    else:
+        state = "NEUTRAL"
+        sl = entry - 1.5 * atr
+        tp = entry + 1.5 * atr
+
+    return state, entry, sl, tp, rsi_value
 
 
 # ----------------------------------------------------------------------
@@ -177,7 +205,7 @@ def generate_chart(df: pd.DataFrame, pair_name: str, signal_type: str,
         linewidths=0.8,
     )
 
-    title = f"{pair_name} — {signal_type} SIGNAL"
+    title = f"{pair_name} — {signal_type}"
 
     mpf.plot(
         plot_df,
@@ -194,7 +222,7 @@ def generate_chart(df: pd.DataFrame, pair_name: str, signal_type: str,
 
 
 # ----------------------------------------------------------------------
-# TELEGRAM SENDING
+# TELEGRAM SENDING (automatic scanner)
 # ----------------------------------------------------------------------
 async def send_signal_to_subscribers(bot: Bot, pair_name: str, signal_type: str,
                                       entry: float, sl: float, tp: float,
@@ -218,7 +246,7 @@ async def send_signal_to_subscribers(bot: Bot, pair_name: str, signal_type: str,
 
 
 # ----------------------------------------------------------------------
-# CORE SCAN LOOP
+# AUTOMATIC SCAN LOOP
 # ----------------------------------------------------------------------
 async def scan_and_send(bot: Bot):
     last_signals = get_last_signals()
@@ -227,7 +255,7 @@ async def scan_and_send(bot: Bot):
         try:
             df = fetch_price_data(ticker)
             df = calculate_indicators(df)
-            signal_type, entry, sl, tp = check_signal(df)
+            signal_type, entry, sl, tp = check_crossover_signal(df)
 
             if signal_type is None:
                 continue
@@ -250,42 +278,97 @@ async def scan_and_send(bot: Bot):
             logger.error(f"Error processing {pair_name}: {e}")
 
 
+async def periodic_scan(context: ContextTypes.DEFAULT_TYPE):
+    await scan_and_send(context.bot)
+
+
 # ----------------------------------------------------------------------
 # TELEGRAM COMMAND HANDLERS
 # ----------------------------------------------------------------------
-async def start_command(update, context: ContextTypes.DEFAULT_TYPE):
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     add_subscriber(update.effective_chat.id)
     pairs_list = ", ".join(PAIRS.keys())
     await update.message.reply_text(
         "✅ You're subscribed to FX Chart Signals!\n\n"
         f"Tracked pairs: {pairs_list}\n"
         f"Timeframe: {TIMEFRAME}\n\n"
-        "Use /stop to unsubscribe.\n\n"
+        "Commands:\n"
+        "/signal — get an instant chart + signal for any pair\n"
+        "/stop — unsubscribe from automatic alerts\n"
+        "/status — see the last automatic signal per pair\n\n"
         "⚠️ Signals are for informational purposes only, not financial advice."
     )
 
 
-async def stop_command(update, context: ContextTypes.DEFAULT_TYPE):
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     remove_subscriber(update.effective_chat.id)
-    await update.message.reply_text("You've been unsubscribed from signals.")
+    await update.message.reply_text("You've been unsubscribed from automatic signals.")
 
 
-async def status_command(update, context: ContextTypes.DEFAULT_TYPE):
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_signals = get_last_signals()
     if not last_signals:
-        await update.message.reply_text("No signals sent yet.")
+        await update.message.reply_text("No automatic signals sent yet.")
         return
     lines = [f"{pair}: {info['type']} at {info['time']}" for pair, info in last_signals.items()]
-    await update.message.reply_text("Last signals:\n" + "\n".join(lines))
+    await update.message.reply_text("Last automatic signals:\n" + "\n".join(lines))
+
+
+async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows a button for each pair. Works for any user, subscribed or not."""
+    keyboard = [
+        [InlineKeyboardButton(pair, callback_data=f"signal:{pair}")]
+        for pair in PAIRS
+    ]
+    await update.message.reply_text(
+        "Pick a pair to get an instant chart + current signal:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def signal_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the button tap: fetches fresh data and sends the chart."""
+    query = update.callback_query
+    await query.answer()  # acknowledge the tap so the button stops "loading"
+
+    pair_name = query.data.split("signal:", 1)[1]
+    ticker = PAIRS.get(pair_name)
+    if not ticker:
+        await query.message.reply_text("Unknown pair, please try /signal again.")
+        return
+
+    await query.message.reply_text(f"⏳ Generating {pair_name} chart...")
+
+    try:
+        df = fetch_price_data(ticker)
+        df = calculate_indicators(df)
+        state, entry, sl, tp, rsi_value = get_current_state(df)
+        chart_path = generate_chart(df, pair_name, state, entry, sl, tp)
+
+        emoji = {"BUY": "🟢", "SELL": "🔴", "NEUTRAL": "🟡"}[state]
+        caption = (
+            f"{emoji} {pair_name} — Current: {state}\n"
+            f"Timeframe: {TIMEFRAME}\n"
+            f"Price: {entry:.5f}\n"
+            f"Reference SL: {sl:.5f}\n"
+            f"Reference TP: {tp:.5f}\n"
+            f"RSI: {rsi_value:.1f}\n\n"
+            f"⚠️ Not financial advice. Trade at your own risk."
+        )
+
+        with open(chart_path, "rb") as img:
+            await query.message.reply_photo(photo=img, caption=caption)
+
+    except Exception as e:
+        logger.error(f"Error generating on-demand signal for {pair_name}: {e}")
+        await query.message.reply_text(
+            f"Sorry, couldn't fetch data for {pair_name} right now. Try again shortly."
+        )
 
 
 # ----------------------------------------------------------------------
-# BACKGROUND JOB
+# MAIN
 # ----------------------------------------------------------------------
-async def periodic_scan(context: ContextTypes.DEFAULT_TYPE):
-    await scan_and_send(context.bot)
-
-
 def main():
     if not BOT_TOKEN:
         raise SystemExit(
@@ -299,6 +382,8 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("stop", stop_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("signal", signal_command))
+    application.add_handler(CallbackQueryHandler(signal_button_callback, pattern=r"^signal:"))
 
     application.job_queue.run_repeating(
         periodic_scan, interval=CHECK_INTERVAL_SECONDS, first=10
